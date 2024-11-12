@@ -21,4 +21,4 @@ if err != nil { ... }
 
 ## Credits:
 
-This was adapted from the `mbtiles` package in [mbtileserver](https://github.com/consbio/mbtileserver) to use the `crawshaw.io/sqlite` SQLite library.
+This fork uses the `modernc.org/sqlite` SQLite library instead of `crawshaw.io/sqlite`.
