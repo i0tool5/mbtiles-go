@@ -1,4 +1,4 @@
-module github.com/brendan-ward/mbtiles-go
+module github.com/i0tool5/mbtiles-go
 
 go 1.21
 
