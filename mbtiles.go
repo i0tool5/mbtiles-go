@@ -348,47 +348,6 @@ func validateRequiredTables(con *sqlite.Conn) error {
 	return nil
 }
 
-// getTileFormat reads the first 8 bytes of the first tile in the database.
-// See TileFormat for list of supported tile formats.
-func getTileFormat(con *sqlite.Conn) (TileFormat, error) {
-	query, _, err := con.PrepareTransient("select tile_data from tiles limit 1")
-	if err != nil {
-		return UNKNOWN, err
-	}
-	defer query.Finalize()
-
-	hasRow, err := query.Step()
-	if err != nil {
-		return UNKNOWN, err
-	}
-	if !hasRow {
-		return UNKNOWN, errors.New("'tiles' table must be non-empty")
-	}
-
-	r := query.ColumnReader(0)
-	if r.Size() < 8 {
-		return UNKNOWN, errors.New("tile data too small to determine tile format")
-	}
-
-	magicWord := make([]byte, 8)
-	_, err = r.Read(magicWord)
-	if err != nil {
-		return UNKNOWN, err
-	}
-
-	format, err := detectTileFormat(magicWord)
-	if err != nil {
-		return UNKNOWN, err
-	}
-
-	// GZIP masks PBF, which is only expected type for tiles in GZIP format
-	if format == GZIP {
-		format = PBF
-	}
-
-	return format, nil
-}
-
 // getTileFormatAndSize reads the first tile in the database to detect the tile
 // format and if PNG also the size.
 // See TileFormat for list of supported tile formats.
