@@ -2,6 +2,8 @@ package mbtiles
 
 import (
 	"context"
+	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,14 +13,14 @@ import (
 	"strings"
 	"time"
 
-	"crawshaw.io/sqlite"
-	"crawshaw.io/sqlite/sqlitex"
+	"modernc.org/sqlite"
+	_ "modernc.org/sqlite"
 )
 
 // MBtiles provides a basic handle for an mbtiles file.
 type MBtiles struct {
 	filename  string
-	pool      *sqlitex.Pool
+	pool      *sql.DB
 	format    TileFormat
 	timestamp time.Time
 	tilesize  uint32
@@ -47,6 +49,12 @@ func FindMBtiles(path string) ([]string, error) {
 	return filenames, err
 }
 
+type backupCloser interface {
+	NewBackup(dstUri string) (*sqlite.Backup, error)
+	NewRestore(srcUri string) (*sqlite.Backup, error)
+	Close() error
+}
+
 // OpenInMemory opens an MBtiles file for reading, and validates that it has the correct
 // structure. Then it loads it to in-memory database. Use this function only with files small enough to be
 // loaded in-memory.
@@ -59,50 +67,92 @@ func OpenInMemory(path string) (*MBtiles, error) {
 	// open a single connection first while we are verifying the database
 	// since there are issues closing out a connection pool on error here
 	// we also use this connection to copy existing DB to in memory DB
-	srcCon, err := sqlite.OpenConn(path, sqlite.SQLITE_OPEN_READONLY|sqlite.SQLITE_OPEN_NOMUTEX)
+	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, err
 	}
-	defer srcCon.Close()
+	defer db.Close()
 
-	err = validateRequiredTables(srcCon)
+	srcConn, err := db.Conn(context.Background())
 	if err != nil {
 		return nil, err
 	}
-	format, tilesize, err := getTileFormatAndSize(srcCon)
+	defer srcConn.Close()
+
+	inMemoryPath := "file::mem:?mode=memory"
+	var inMemDB *sql.DB
+	err = srcConn.Raw(func(driverConn any) error {
+		driver, ok := driverConn.(backupCloser)
+		if !ok {
+			return errors.New("driver does not support backups")
+		}
+		bck, err := driver.NewBackup(inMemoryPath)
+		if err != nil {
+			return err
+		}
+
+		for more := true; more; {
+			more, err = bck.Step(-1)
+			if err != nil {
+				return err
+			}
+		}
+		conn, err := bck.Commit()
+		if err != nil {
+			return err
+		}
+		inMemDB = sql.OpenDB(newsqliteConnection(conn, db.Driver()))
+		if inMemDB == nil {
+			return errors.New("can not open in memory database backup")
+		}
+
+		return nil
+
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	inMemoryPath := "file::memory:?mode=memory"
-	dstCon, err := sqlite.OpenConn(inMemoryPath, sqlite.SQLITE_OPEN_CREATE|sqlite.SQLITE_OPEN_READWRITE|sqlite.SQLITE_OPEN_URI)
+	dstConn, err := inMemDB.Conn(context.Background())
 	if err != nil {
 		return nil, err
 	}
-	defer dstCon.Close()
 
-	bkp, err := srcCon.BackupInit("", "", dstCon)
+	err = validateRequiredTables(dstConn)
 	if err != nil {
-		return nil, fmt.Errorf("backup %s to in memory db: %w", path, err)
+		return nil, err
 	}
-	defer bkp.Finish()
-
-	if err := bkp.Step(-1); err != nil {
-		return nil, fmt.Errorf("transfer whole db: %w", err)
-	}
-
-	pool, err := sqlitex.Open(inMemoryPath, sqlite.SQLITE_OPEN_READONLY|sqlite.SQLITE_OPEN_URI|sqlite.SQLITE_OPEN_NOMUTEX, 10)
+	format, tilesize, err := getTileFormatAndSize(dstConn)
 	if err != nil {
 		return nil, err
 	}
 
 	return &MBtiles{
 		filename:  inMemoryPath,
-		pool:      pool,
+		pool:      inMemDB,
 		timestamp: modTime,
 		format:    format,
 		tilesize:  tilesize,
 	}, nil
+}
+
+type sqliteConnection struct {
+	conn   driver.Conn
+	driver driver.Driver
+}
+
+func newsqliteConnection(conn driver.Conn, driver driver.Driver) sqliteConnection {
+	return sqliteConnection{conn, driver}
+}
+
+// Connect implements method of driver.Connector interface.
+func (s sqliteConnection) Connect(context.Context) (driver.Conn, error) {
+	return s.conn, nil
+}
+
+// Driver implements method of driver.Connector interface.
+func (s sqliteConnection) Driver() driver.Driver {
+	return s.driver
 }
 
 // Open opens an MBtiles file for reading, and validates that it has the correct
@@ -113,13 +163,21 @@ func Open(path string) (*MBtiles, error) {
 		return nil, err
 	}
 
-	// open a single connection first while we are verifying the database
-	// since there are issues closing out a connection pool on error here
-	con, err := sqlite.OpenConn(path, sqlite.SQLITE_OPEN_READONLY|sqlite.SQLITE_OPEN_NOMUTEX)
+	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, err
 	}
-	defer con.Close()
+
+	con, err := db.Conn(context.Background())
+	if err != nil {
+		return nil, err
+	}
+
+	var version string
+	err = con.QueryRowContext(context.TODO(), "select sqlite_version()").Scan(&version)
+	if err != nil {
+		return nil, err
+	}
 
 	err = validateRequiredTables(con)
 	if err != nil {
@@ -130,20 +188,15 @@ func Open(path string) (*MBtiles, error) {
 		return nil, err
 	}
 
-	pool, err := sqlitex.Open(path, sqlite.SQLITE_OPEN_READONLY|sqlite.SQLITE_OPEN_NOMUTEX, 10)
-	if err != nil {
-		return nil, err
-	}
-
-	db := &MBtiles{
+	tilesDB := &MBtiles{
 		filename:  path,
-		pool:      pool,
+		pool:      db,
 		timestamp: modTime,
 		format:    format,
 		tilesize:  tilesize,
 	}
 
-	return db, nil
+	return tilesDB, nil
 }
 
 func getModTime(path string) (time.Time, error) {
@@ -181,32 +234,26 @@ func (db *MBtiles) ReadTile(z int64, x int64, y int64, data *[]byte) error {
 		return err
 	}
 
-	query, err := con.Prepare("select tile_data from tiles where zoom_level = $z and tile_column = $x and tile_row = $y")
+	query, err := con.PrepareContext(context.TODO(), "select tile_data from tiles where zoom_level = $1 and tile_column = $2 and tile_row = $3")
 	if err != nil {
 		return err
 	}
-	defer query.Reset()
+	defer query.Close()
 
-	query.SetInt64("$z", z)
-	query.SetInt64("$x", x)
-	query.SetInt64("$y", y)
-
-	hasRow, err := query.Step()
-	if err != nil {
-		return err
-	}
-
-	// If this tile does not exist in the database, return empty bytes
-	if !hasRow {
+	row := query.QueryRow(z, x, y)
+	if row == nil {
 		*data = nil
 		return nil
 	}
+	if row.Err() != nil {
+		return row.Err()
+	}
 
-	var tileData = make([]byte, query.ColumnLen(0))
-	query.ColumnBytes(0, tileData)
-	*data = tileData[:]
-
+	err = row.Scan(data)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
 		return err
 	}
 
@@ -226,48 +273,46 @@ func (db *MBtiles) ReadMetadata() (map[string]interface{}, error) {
 		return nil, err
 	}
 
-	var (
-		key   string
-		value string
-	)
 	metadata := make(map[string]interface{})
 
-	query, err := con.Prepare("select name, value from metadata where value is not ''")
+	query, err := con.PrepareContext(context.TODO(), "select name, value from metadata where value is not ''")
 	if err != nil {
 		return nil, err
 	}
-	defer query.Reset()
+	defer query.Close()
 
-	for {
-		hasRow, err := query.Step()
+	rows, err := query.Query()
+	if err != nil {
+		return nil, err
+	}
+	var (
+		name  sql.NullString
+		value sql.NullString
+	)
+	for rows.Next() {
+		err := rows.Scan(&name, &value)
 		if err != nil {
 			return nil, err
 		}
-		if !hasRow {
-			break
-		}
 
-		key = query.GetText("name")
-		value = query.GetText("value")
-
-		switch key {
+		switch name.String {
 		case "maxzoom", "minzoom":
-			metadata[key], err = strconv.Atoi(value)
+			metadata[name.String], err = strconv.Atoi(value.String)
 			if err != nil {
-				return nil, fmt.Errorf("cannot read metadata item %s: %v", key, err)
+				return nil, fmt.Errorf("cannot read metadata item %s: %v", name.String, err)
 			}
 		case "bounds", "center":
-			metadata[key], err = parseFloats(value)
+			metadata[name.String], err = parseFloats(value.String)
 			if err != nil {
-				return nil, fmt.Errorf("cannot read metadata item %s: %v", key, err)
+				return nil, fmt.Errorf("cannot read metadata item %s: %v", name.String, err)
 			}
 		case "json":
-			err = json.Unmarshal([]byte(value), &metadata)
+			err = json.Unmarshal([]byte(value.String), &metadata)
 			if err != nil {
 				return nil, fmt.Errorf("unable to parse JSON metadata item: %v", err)
 			}
 		default:
-			metadata[key] = value
+			metadata[name.String] = value.String
 		}
 	}
 
@@ -275,18 +320,19 @@ func (db *MBtiles) ReadMetadata() (map[string]interface{}, error) {
 	_, hasMinZoom := metadata["minzoom"]
 	_, hasMaxZoom := metadata["maxzoom"]
 	if !(hasMinZoom && hasMaxZoom) {
-		q2, err := con.Prepare("select min(zoom_level), max(zoom_level) from tiles")
+		q2, err := con.PrepareContext(context.TODO(), "select min(zoom_level), max(zoom_level) from tiles")
 		if err != nil {
 			return nil, err
 		}
-		defer q2.Reset()
-		_, err = q2.Step()
-		if err != nil {
-			return nil, err
-		}
+		defer q2.Close()
+		row := q2.QueryRow()
+		var (
+			minZoom, maxZoom int
+		)
+		row.Scan(&minZoom, &maxZoom)
 
-		metadata["minzoom"] = q2.ColumnInt(0)
-		metadata["maxzoom"] = q2.ColumnInt(1)
+		metadata["minzoom"] = minZoom
+		metadata["maxzoom"] = maxZoom
 	}
 	return metadata, nil
 }
@@ -313,8 +359,8 @@ func (db *MBtiles) GetTimestamp() time.Time {
 
 // getConnection gets a sqlite.Conn from an open connection pool.
 // closeConnection(con) must be called to release the connection.
-func (db *MBtiles) getConnection(ctx context.Context) (*sqlite.Conn, error) {
-	con := db.pool.Get(ctx)
+func (db *MBtiles) getConnection(ctx context.Context) (*sql.Conn, error) {
+	con, _ := db.pool.Conn(ctx)
 	if con == nil {
 		return nil, errors.New("connection could not be opened")
 	}
@@ -322,95 +368,48 @@ func (db *MBtiles) getConnection(ctx context.Context) (*sqlite.Conn, error) {
 }
 
 // closeConnection closes an open sqlite.Conn and returns it to the pool.
-func (db *MBtiles) closeConnection(con *sqlite.Conn) {
-	if con != nil {
-		db.pool.Put(con)
-	}
+func (db *MBtiles) closeConnection(con *sql.Conn) {
+	con.Close()
 }
 
 // validateRequiredTables checks that both 'tiles' and 'metadata' tables are
 // present in the database
-func validateRequiredTables(con *sqlite.Conn) error {
-	query, _, err := con.PrepareTransient("SELECT count(*) as c FROM sqlite_master WHERE name in ('tiles', 'metadata')")
+func validateRequiredTables(con *sql.Conn) error {
+	query, err := con.PrepareContext(context.Background(), "SELECT count(*) as c FROM sqlite_master WHERE name in ('tiles', 'metadata')")
 	if err != nil {
 		return err
 	}
-	defer query.Finalize()
+	defer query.Close()
 
-	_, err = query.Step()
-	if err != nil {
+	result := query.QueryRow()
+	if err := result.Err(); err != nil {
 		return err
 	}
 
-	if query.ColumnInt32(0) < 2 {
+	count := 0
+	result.Scan(&count)
+	if count < 2 {
 		return errors.New("missing one or more required tables: tiles, metadata")
 	}
 	return nil
 }
 
-// getTileFormat reads the first 8 bytes of the first tile in the database.
-// See TileFormat for list of supported tile formats.
-func getTileFormat(con *sqlite.Conn) (TileFormat, error) {
-	query, _, err := con.PrepareTransient("select tile_data from tiles limit 1")
-	if err != nil {
-		return UNKNOWN, err
-	}
-	defer query.Finalize()
-
-	hasRow, err := query.Step()
-	if err != nil {
-		return UNKNOWN, err
-	}
-	if !hasRow {
-		return UNKNOWN, errors.New("'tiles' table must be non-empty")
-	}
-
-	r := query.ColumnReader(0)
-	if r.Size() < 8 {
-		return UNKNOWN, errors.New("tile data too small to determine tile format")
-	}
-
-	magicWord := make([]byte, 8)
-	_, err = r.Read(magicWord)
-	if err != nil {
-		return UNKNOWN, err
-	}
-
-	format, err := detectTileFormat(magicWord)
-	if err != nil {
-		return UNKNOWN, err
-	}
-
-	// GZIP masks PBF, which is only expected type for tiles in GZIP format
-	if format == GZIP {
-		format = PBF
-	}
-
-	return format, nil
-}
-
 // getTileFormatAndSize reads the first tile in the database to detect the tile
 // format and if PNG also the size.
 // See TileFormat for list of supported tile formats.
-func getTileFormatAndSize(con *sqlite.Conn) (TileFormat, uint32, error) {
+func getTileFormatAndSize(con *sql.Conn) (TileFormat, uint32, error) {
 	var tilesize uint32 = 0 // not detected for all formats
 
-	query, _, err := con.PrepareTransient("select tile_data from tiles limit 1")
+	query, err := con.PrepareContext(context.Background(), "select tile_data from tiles limit 1")
 	if err != nil {
 		return UNKNOWN, tilesize, err
 	}
-	defer query.Finalize()
+	defer query.Close()
 
-	hasRow, err := query.Step()
-	if err != nil {
-		return UNKNOWN, tilesize, err
-	}
-	if !hasRow {
-		return UNKNOWN, tilesize, errors.New("'tiles' table must be non-empty")
-	}
+	hasRow := query.QueryRow()
 
-	var tileData = make([]byte, query.ColumnLen(0))
-	query.ColumnBytes(0, tileData)
+	tileData := make([]byte, 0)
+	hasRow.Scan(&tileData)
 
 	format, err := detectTileFormat(tileData)
 	if err != nil {
